@@ -18,13 +18,34 @@ RUNTIME = REPO / "research/ext/Royale-20261005/runtime"
 # Opt-in upgrade: ROYALE_RUNTIME=20261006 selects the newer pinned build. Unset = the pin above, unchanged
 # (its stamp carries no runtime_id, so existing checkpoints' recorded stamps still compare equal).
 RUNTIME_ID = None
-_selected = os.environ.get("ROYALE_RUNTIME", "").strip()
+# Platform-neutral aliases: the "unpinned-linux" mode simply means "the wheels installed in THIS venv, no byte check",
+# which is how a Windows checkout runs too (the venv's royalesim wheel is win_amd64). The id stays "unpinned-linux"
+# internally because checkpoints record it in their runtime stamp and --resume compares stamps.
+_ALIASES = {"unpinned": "unpinned-linux", "wheels": "unpinned-linux", "unpinned-win": "unpinned-linux"}
+_raw = os.environ.get("ROYALE_RUNTIME", "").strip()
+_selected = _ALIASES.get(_raw, _raw)
+if not _selected:
+    # The default pin is a byte-verified checkout under research/ext. A plain clone has the manifest but not the
+    # runtime, and then the historical default (which aborts) is just a ritual: fall back to the wheels installed in
+    # THIS venv -- the same thing ROYALE_RUNTIME=unpinned selects. The run's runtime stamp still records runtime_id
+    # "unpinned-linux", so provenance is unchanged and --resume compares like with like.
+    #
+    # No message by default: on a checkout that does not vendor the runtime this is the ONLY path it can take, so the
+    # notice is a permanent warning about a state the caller cannot change -- it opened every CLI's output. The stamp
+    # is the record; ROYALE_RUNTIME_VERBOSE=1 asks for the sentence back.
+    if not (RUNTIME.exists() and RUNTIME.is_dir()):
+        _selected = "unpinned-linux"
+        if os.environ.get("ROYALE_RUNTIME_VERBOSE", "").strip() not in ("", "0"):
+            print(f"royale_runtime: the pinned runtime is not vendored ({RUNTIME}) -- using the installed venv wheels "
+                  f"(equivalent to ROYALE_RUNTIME=unpinned). Set ROYALE_RUNTIME=<pinned id> to reproduce a pinned build.",
+                  file=sys.stderr, flush=True)
 if _selected:
     if _selected not in ("20261006", "20261006-linux", "20261012", "20261012-linux", "20261016-linux", "fork36-linux",
                          "fin13-linux", "fin15-linux", "fin16-linux", "fork", "unpinned-linux"):
         raise RuntimeError(f"Unknown ROYALE_RUNTIME={_selected!r}; known opt-in runtimes: "
                            "'20261006', '20261006-linux', '20261012', '20261012-linux', '20261016-linux', "
-                           "'fork36-linux', 'fin13-linux', 'fin15-linux', 'fin16-linux', 'fork', 'unpinned-linux'")
+                           "'fork36-linux', 'fin13-linux', 'fin15-linux', 'fin16-linux', 'fork', 'unpinned-linux' "
+                           "(aliases: 'unpinned', 'wheels')")
     RUNTIME_ID = _selected
     MANIFEST = REPO / "scratchpad/gauntlet/L73/royale_update_20261006/build_manifest.json"
     RUNTIME = REPO / "research/ext/Royale-20261006/runtime"
@@ -88,7 +109,12 @@ def _verify_files(runtime: Path, manifest: dict) -> None:
             continue   # platform-specific (Windows binary, wheel metadata); provenance is checked in activate()
         path = (runtime / name).resolve()
         if not path.is_relative_to(runtime) or not path.is_file():
-            raise RuntimeError(f"Pinned Royale runtime file missing or outside runtime: {name}")
+            raise RuntimeError(
+                f"Pinned Royale runtime file missing or outside runtime: {name} "
+                f"(ROYALE_RUNTIME={RUNTIME_ID!r} -> {runtime}) -- this checkout runs the wheels installed in the venv; "
+                f"set ROYALE_RUNTIME=unpinned (PowerShell: $env:ROYALE_RUNTIME='unpinned'; bash: "
+                f"export ROYALE_RUNTIME=unpinned) to use the wheels installed in this venv, or point ROYALE_RUNTIME "
+                f"at a pinned runtime that is present")
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
             raise RuntimeError(f"Pinned Royale runtime file changed: {name}")
 

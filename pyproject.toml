@@ -1,0 +1,27 @@
+[project]
+name = "clashai"
+version = "0.0.0"
+description = "ClashAI reconstruction environment (engine + IL/RL + training)"
+requires-python = ">=3.12"
+dependencies = [
+    "msgspec>=0.22.0",
+    "numpy>=2.5.4",
+    "polars>=2.1.0",
+    "pygame>=2.6.1",
+    "pyyaml>=6.0.3",
+    "royalegym==0.1.18",
+    "royalesim==0.1.17",
+    "torch>=2.15.0",
+    "torchvision>=0.29.2",
+]
+
+[tool.uv]
+# CUDA wheels for torch; everything else resolves from PyPI.
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu132" }
+torchvision = { index = "pytorch-cu132" }

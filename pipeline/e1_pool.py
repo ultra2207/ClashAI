@@ -1,8 +1,8 @@
 """E1 option B: ghost pool v1 (from corpus v6), its frozen held-out split, and the engine env that plays it.
 
-    icebow/.venv/Scripts/python.exe -m pipeline.e1_pool build                  # writes the 3 NEW files, never overwrites
-    icebow/.venv/Scripts/python.exe -m pipeline.e1_pool build --out-dir <dir>  # same build into another (empty) dir
-    icebow/.venv/Scripts/python.exe -m pipeline.e1_pool verify                 # sha + re-derive the split, compare
+    uv run python -m pipeline.e1_pool build                  # writes the 3 NEW files, never overwrites
+    uv run python -m pipeline.e1_pool build --out-dir <dir>  # same build into another (empty) dir
+    uv run python -m pipeline.e1_pool verify                 # sha + re-derive the split, compare
 
 Nothing here touches the engine except ``PoolV1Env`` (constructed only by the eval harness, never by the builder).
 
@@ -241,6 +241,11 @@ def build_row(rec: dict, deck, want_forms: dict, battles: dict[str, dict], plays
     battle = battles.get(tag)
     if battle is None:
         return None, "no_battle_row"
+    if rec.get("deck_swap"):                     # corpus_driver records sides AFTER its own swap decision:
+        battle = dict(battle,                    # `final_decks` is in the engine/driven order while the crawl row
+                      team_deck=battle["opponent_deck"],      # is in the crawler's, so compare like with like
+                      opponent_deck=battle["team_deck"])
+        stats["battle_row_swapped"] += 1
     items = {}
     for s in (0, 1):
         try:
