@@ -1,6 +1,6 @@
 """Train ONLY a ``CellRefine`` module (model_gen) on top of a frozen generalist checkpoint (L73 centre-column fix).
 
-    python -m pipeline.train_cell_refine --base icebow/data/pipeline/gen_v32_s0/gen_s0.pt \
+    uv run python -m pipeline.train_cell_refine --base icebow/data/pipeline/gen_v32_s0/gen_s0.pt \
         --data icebow/data/pipeline/gen_dataset_v32_fv5.npz --epochs 2 --amp bf16
 
 Imitation cell CE on the TRAIN play rows, teacher-forced on the pro's card, with train_gen's mirror augmentation
@@ -46,7 +46,9 @@ def main(argv=None) -> int:
         raise SystemExit("refusing to overwrite the base checkpoint")
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from .device import cuda
+
+    dev = cuda()
     model, st = load_model(a.base, dev)
     if getattr(model, "cell_refine", None) is not None:
         raise SystemExit("base already has a cell_refine module")

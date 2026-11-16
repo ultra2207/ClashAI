@@ -1,7 +1,7 @@
 """MGPU: a 20-second check of the collectives the data-parallel learner uses, on the real devices / backend, before any replay:
 group init (backend + the gloo object group), all_gather_object, the flat state broadcast (float32 / int64 / bool-as-uint8), the
 
-    python -m pipeline.learner_dp_selftest --devices cuda:0,cuda:1,cuda:2,cuda:3 --backend nccl [--gb 1.0] [--out r.json]
+    uv run python -m pipeline.learner_dp_selftest --devices cuda:0,cuda:1,cuda:2,cuda:3 --backend nccl [--gb 1.0] [--out r.json]
 Exit code 0 = every check passed. cpu devices + gloo run the same code anywhere.
 """
 from __future__ import annotations

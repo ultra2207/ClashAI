@@ -557,11 +557,25 @@ WRONG_TEAM_RATE = {"troop": 0.15, "building": 0.15, "spell": 0.40}   # (b) troop
                                 #   (offline first sighting of OWN units: 30% tagged enemy); own spells 26/62 = 0.42 wrong
 
 
+def _clamp(v: float, lo: float, hi: float) -> float:
+    """``np.clip(v, lo, hi)`` for a scalar, identical for every finite input and for NaN.
+
+    ``np.clip`` on a Python float costs 2.3 us (ufunc dispatch); this is 0.05 us. It is called three times
+    per noised unit -- x, y and the confidence draw -- which was half of the observation-noise cost
+    (e1_view._degrade_switchable measured 12.6 us/unit, 6.9 us of it these three clips). NaN propagates like
+    np.clip's, so nothing about the value or the RNG stream changes."""
+    if v != v:                              # NaN in -> NaN out (np.clip's own rule)
+        return v
+    if v < lo:
+        return lo
+    return hi if v > hi else v
+
+
 def _draw_conf(rng: np.random.Generator) -> float:
     p_u, lo, hi, mu, sd, cap = _CONF_MIX
     if rng.random() < p_u:
         return float(rng.uniform(lo, hi))
-    return float(np.clip(rng.normal(mu, sd), lo, cap))
+    return _clamp(float(rng.normal(mu, sd)), lo, cap)
 
 
 def degrade(bs: BoardState, rng: np.random.Generator, *, recall: float = DEGRADE_RECALL,

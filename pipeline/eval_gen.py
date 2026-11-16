@@ -1,6 +1,6 @@
 """Generalist evaluator: ``GenModel`` checkpoint + ``dataset_gen`` npz -> S1-comparable metrics.
 
-    icebow/.venv/Scripts/python.exe -m pipeline.eval_gen --ckpt DIR/gen_s0.pt --data icebow/data/pipeline/gen_dataset_starter.npz
+    uv run python -m pipeline.eval_gen --ckpt DIR/gen_s0.pt --data icebow/data/pipeline/gen_dataset_starter.npz
 
 ``evaluate`` is ``train_s1.evaluate`` line for line; the only differences are the model call (identity inputs, the
 cell head teacher-forced on the pro's card IDENTITY instead of its deck slot) and what "card" indexes: S1's argmax is
@@ -270,7 +270,9 @@ def main(argv=None) -> int:
     ap.add_argument("--val-sample", type=int, default=0,
                     help="score a fixed seed-0 sample of N all-deck val rows (train_gen's per-epoch set) instead of all")
     a = ap.parse_args(argv)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from .device import cuda
+
+    dev = cuda()
     model, st = load_model(a.ckpt, dev)
     arrs, meta = load_ds(a.data)
     if meta["card_vocab"] != st["card_vocab"]:

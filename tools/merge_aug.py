@@ -5,7 +5,7 @@ only variable is the extra degraded copies of the train rows.
 
 
 usage (from the repo root):
-  icebow\\.venv\\Scripts\\python.exe tools\\merge_aug.py --clean <npz> --degraded <npz> --out <npz>
+  uv run python tools\\merge_aug.py --clean <npz> --degraded <npz> --out <npz>
 """
 from __future__ import annotations
 

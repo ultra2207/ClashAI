@@ -2,7 +2,7 @@
 same held-out ghosts, plus the e1_eval command lines that produce those two runs.
 
 
-    python -m pipeline.rl_gate --commands --init-ckpt icebow/data/pipeline/s1_icebow_v6lat_s0.pt ^
+    uv run python -m pipeline.rl_gate --commands --init-ckpt icebow/data/pipeline/s1_icebow_v6lat_s0.pt ^
 
 ``--commands --config <run dir>/config.yaml`` (L68 T12b): the printed e1_eval lines carry that RL run's CONDITION keys
 (noise_off / opp_elixir / action_delay_ticks / extrapolate_ticks -> --noise-off / --opp-elixir / --action-delay /
@@ -275,7 +275,7 @@ def print_commands(init_ckpt: str, cand_ckpt: str, out_root: str, engine: str, c
         ports = {"slot0": (38031, "0/2"), "slot1": (38032, "1/2")}
         for label, ckpt in (("init", init_ckpt), ("cand", cand_ckpt)):
             for slot, (port, shard) in ports.items():
-                print(f"icebow/.venv/Scripts/python.exe -m pipeline.e1_eval --port {port} --ckpt {ckpt} "
+                print(f"uv run python -m pipeline.e1_eval --port {port} --ckpt {ckpt} "
                       f"--split heldout --entries all --seeds 0,1,2 --shard {shard}{cond} --out {out_root}/{label}/{slot}")
         print()
 

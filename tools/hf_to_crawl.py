@@ -24,8 +24,8 @@ Outputs in --out: battles.csv, plays_ext.csv, tags.json (+ tags_a.json / tags_b.
 dedupe_report.json.
 
 usage (from the repo root; defaults read data/hf/replays and write data/hf_crawl/<deck>, both gitignored):
-  icebow\\.venv\\Scripts\\python.exe tools\\hf_to_crawl.py icebow
-  icebow\\.venv\\Scripts\\python.exe tools\\hf_to_crawl.py hogeq --hf data\\hf\\replays --out data\\hf_crawl\\hogeq
+  uv run python tools\\hf_to_crawl.py icebow
+  uv run python tools\\hf_to_crawl.py hogeq --hf data\\hf\\replays --out data\\hf_crawl\\hogeq
 """
 from __future__ import annotations
 

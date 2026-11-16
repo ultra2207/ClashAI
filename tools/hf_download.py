@@ -10,8 +10,8 @@ Files land at <dest>/<manifest path>, e.g. data/hf/replays/part-000000.parquet. 
 repo root) is gitignored by the `data/` rule in .gitignore, so ~825 MB never gets committed.
 
 usage (from the repo root):
-  icebow\\.venv\\Scripts\\python.exe tools\\hf_download.py --dry-run     # list what would be fetched, no network
-  icebow\\.venv\\Scripts\\python.exe tools\\hf_download.py               # fetch (or resume) all 52 replay parts
+  uv run python tools\\hf_download.py --dry-run     # list what would be fetched, no network
+  uv run python tools\\hf_download.py               # fetch (or resume) all 52 replay parts
 """
 from __future__ import annotations
 

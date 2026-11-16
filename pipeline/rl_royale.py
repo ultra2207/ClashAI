@@ -4304,7 +4304,9 @@ class Learner:
         self.runtime = activate()
         from pipeline import policy_io as ep
         self.cfg, self.run, self.run_dir, self.ck_dir, self.log = cfg, run, run_dir, ck_dir, log
-        self.dev = torch.device(cfg["learner_device"])
+        from .device import resolve
+
+        self.dev = resolve(cfg.get("learner_device"))
         self.init_path = REPO / cfg["init"]
         condition_cfg(cfg)                                    # validate the condition keys before anything runs
         adv_cfg(cfg)                                          # ... and the advantage (R1) keys

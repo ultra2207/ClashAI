@@ -1,6 +1,6 @@
 """S1 trainer: ``pipeline.dataset`` npz -> ``S1Model`` checkpoint + per-epoch metrics json.
 
-    python -m pipeline.train_s1 icebow --baseline            # board-blind histogram baseline, same val rows
+    uv run python -m pipeline.train_s1 icebow --baseline            # board-blind histogram baseline, same val rows
 
 Losses: cell CE on PLAY rows (teacher-forced on the pro's card), hand-masked card CE on PLAY rows, gate BCE
 on all rows, wait-for-card CE on WAIT rows, crown-diff CE on all rows. Mirror augmentation with p = 0.5.
@@ -34,10 +34,18 @@ MAX_U = 64
 class Rows:
     """"""
 
+    PAD_BYTES = 1 << 30   # <= this: the padded token block is precomputed once; larger rows are padded per batch
+
     def __init__(self, arrs: dict, idx: np.ndarray, device):
         self.a, self.idx, self.dev = arrs, idx, device
         self.off = arrs["off"]
-        self.tok_all = torch.from_numpy(arrs["tok"])
+        self.tok = arrs["tok"]
+        self.tok_all = torch.from_numpy(arrs["tok"])     # CPU: subclasses gather this batch's tokens (eval_gen.GenRows)
+        self.lens = np.minimum(self.off[1:] - self.off[:-1], MAX_U).astype(np.int64)
+        self.wide = int(self.lens.max()) if len(self.lens) else 0
+        self.tok_pad, self.mask_pad = None, None
+        if len(self.lens) * self.wide * TOK_F * 4 <= self.PAD_BYTES:
+            self.tok_pad, self.mask_pad = self._pad_tokens(arrs)
         self.sc = torch.from_numpy(arrs["sc"]).to(device)
         self.past = torch.from_numpy(arrs["past"]).to(device)
         self.xy = torch.from_numpy(arrs["y_xy"]).to(device)
@@ -47,19 +55,71 @@ class Rows:
         cr = arrs["y_crowns"].astype(np.int64)
         self.value = torch.from_numpy(np.clip(cr[:, 0] - cr[:, 1], -3, 3) + 3).to(device)
 
+    def _pad_tokens(self, arrs: dict) -> tuple[torch.Tensor, torch.Tensor]:
+        """The [N, max_len, F] padded token block and its mask for EVERY row of the dataset (``self.tok_pad``).
+
+        `batch()` used to rebuild this block for every step through a Python loop over the 256 rows -- 8.4 ms
+        of one core per step, measured, with the GPU idle while it ran. Rows are padded in exactly the same way
+        as that loop: a row keeps its first MAX_U tokens, the rest are dropped. Only rows whose block fits
+        ``PAD_BYTES`` take this path (the S1 datasets); a corpus-sized row file (11M rows = 40 GB) allocates that
+        block per batch instead (``_pad_batch``), which is the same padding, one batch at a time."""
+        n = len(self.lens)
+        starts, pos = self._gather_index(np.arange(n))
+        pad = np.zeros((n, self.wide, TOK_F), dtype=np.float32)
+        pad[np.repeat(np.arange(n), self.lens), pos] = self.tok[starts + pos]
+        mask = np.zeros((n, self.wide), dtype=bool)
+        mask[np.repeat(np.arange(n), self.lens), pos] = True
+        return torch.from_numpy(pad).to(self.dev), torch.from_numpy(mask).to(self.dev)
+
+    def _gather_index(self, ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(start, position)`` of every kept token of ``rows = ids``: start = its row's first token in ``tok``."""
+        lens = self.lens[ids]
+        pos = np.arange(int(lens.sum())) - np.repeat(np.cumsum(lens) - lens, lens)
+        starts = np.repeat(self.off[ids], lens)
+        return starts, pos
+
+    def _pad_batch(self, ids: np.ndarray, m: int, ids_t: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``_pad_tokens`` for just ``ids``, padded to ``m`` (the batch maximum)."""
+        ids = np.asarray(ids)
+        lens = np.minimum(self.lens[ids], m)
+        starts, pos = self._gather_index(ids)
+        row = np.repeat(np.arange(len(ids)), lens)
+        pad = np.zeros((len(ids), m, TOK_F), dtype=np.float32)
+        pad[row, pos] = self.tok[starts + pos]
+        mask = np.zeros((len(ids), m), dtype=bool)
+        mask[row, pos] = True
+        return torch.from_numpy(pad).to(self.dev), torch.from_numpy(mask).to(self.dev)
+
     def batch(self, ids: np.ndarray) -> dict:
-        n = len(ids)
-        tok = torch.zeros(n, MAX_U, TOK_F)
-        mask = torch.zeros(n, MAX_U, dtype=torch.bool)
-        for k, i in enumerate(ids):
-            a, b = self.off[i], self.off[i + 1]
-            m = min(b - a, MAX_U)
-            tok[k, :m] = self.tok_all[a:a + m]
-            mask[k, :m] = True
+        """One batch, padded only to the LONGEST row in it.
+
+        The mean row holds 4.2 unit tokens and the widest 37, but a batch padded to the global maximum makes
+        the encoder's attention run over 64 empty slots per row: at bs=256 that was 28k tokens of mostly
+        padding, and attention cost -- which is quadratic in sequence length -- was the whole step. Slicing to
+        the batch maximum keeps every real token and every label identical; only the padding shape changes."""
         ids_t = torch.from_numpy(ids).to(self.dev)
-        return {"tok": tok.to(self.dev), "mask": mask.to(self.dev), "sc": self.sc[ids_t], "past": self.past[ids_t],
-                "xy": self.xy[ids_t], "slot": self.slot[ids_t], "gate": self.gate[ids_t], "wait": self.wait[ids_t],
-                "value": self.value[ids_t]}
+        m = max(int(self.lens[ids].max()), 1)
+        if self.tok_pad is not None:
+            tok, mask = self.tok_pad[ids_t, :m], self.mask_pad[ids_t, :m]
+        else:
+            tok, mask = self._pad_batch(ids, m, ids_t)
+        return {"tok": tok, "mask": mask, "sc": self.sc[ids_t],
+                "past": self.past[ids_t], "xy": self.xy[ids_t], "slot": self.slot[ids_t],
+                "gate": self.gate[ids_t], "wait": self.wait[ids_t], "value": self.value[ids_t]}
+
+    def bucket_perm(self, rng: np.random.Generator) -> np.ndarray:
+        """`self.idx` in length-bucketed, randomly ordered groups: every batch then pads to its own length.
+
+        Without this, `batch()` pads each batch to the widest row it happens to draw, which for a uniform draw
+        is the global maximum -- so the per-batch slice would save nothing. Order inside a bucket is shuffled,
+        and the bucket order is shuffled too, so the batch sequence is still random; it just stops paying for
+        attention over padding. A drop-in replacement for `rng.permutation(self.idx)`."""
+        by_len: dict[int, list[int]] = {}
+        for i in self.idx:
+            by_len.setdefault(int(self.lens[i]), []).append(int(i))
+        groups = [np.asarray(v) for v in by_len.values()]
+        order = rng.permutation(len(groups))
+        return np.concatenate([rng.permutation(groups[g]) for g in order]) if groups else np.empty(0, np.int64)
 
 
 def losses(model: S1Model, b: dict, mirror: bool, grid: str = "floor",
@@ -89,7 +149,12 @@ def losses(model: S1Model, b: dict, mirror: bool, grid: str = "floor",
         parts = {k: v for k, v in parts.items() if k in heads}
         if not parts:
             raise ValueError(f"no loss left after --loss-heads {sorted(heads)}")
-    return sum(parts.values()), {k: float(v.detach()) for k, v in parts.items()}
+    # ONE device-to-host sync for every part, not one per part: each `float(t)` on a CUDA tensor blocks until
+    # the whole queue drains, so the old dict comprehension serialised forward against backward five or six
+    # times a step. `torch.stack(...).tolist()` is a single copy, and the caller's own `float(loss)` is the
+    # second (and last) sync of the step.
+    vals = torch.stack([v.detach() for v in parts.values()]).tolist() if parts else []
+    return sum(parts.values()), dict(zip(parts.keys(), vals))
 
 
 @torch.no_grad()
@@ -103,8 +168,13 @@ def evaluate(model: S1Model, rows: Rows, bs: int = 512, grid: str = "floor") -> 
     # point, in tiles (board frame: x * 18, y * 32). hit = within 0.3 tile (the pro lattice pitch is 0.5).
     off = 0.5 if grid == "floor" else 0.0
     gs = []
+    # Length-sorted, so each eval batch pads to its own longest row instead of to the global maximum. Every
+    # metric below is an integer count or a sum of the same per-row terms, so the order of the batches does
+    # not change the result; it only stops the encoder paying attention over empty unit slots (eval measured
+    # at ~45% of an epoch's wall time, most of it padding).
+    order = rows.idx[np.argsort(rows.lens[rows.idx], kind="stable")]
     for s in range(0, n, bs):
-        ids = rows.idx[s:s + bs]
+        ids = order[s:s + bs]
         b = rows.batch(ids)
         hm = hand_mask_from_sc(b["sc"])
         out = model(b["tok"], b["mask"], b["sc"], b["past"], card_slot=b["slot"].clamp(min=0), hand_mask=hm)
@@ -203,6 +273,12 @@ def main(argv=None) -> int:
                          "which is the right one for the pro-imitation run -- but selecting on a head the "
                          "run does not train (e.g. --loss-heads gate,card) picks an epoch by noise, so a "
                          "distillation run should select on what it optimises (gate_acc / card_top1).")
+    ap.add_argument("--fp32", action="store_true",
+                    help="disable the bf16 autocast on forward+loss. Measured on this model and data: 99 -> 53 "
+                         "ms/step for bs=256 with the first-20-step loss trajectory within 0.3%% of fp32.")
+    ap.add_argument("--save-every", type=float, default=600.0,
+                    help="seconds between ROLLING checkpoint writes (s1_<tag>_last.pt), so killing the run loses "
+                         "at most this much work. 0 disables. The selected checkpoint s1_<tag>.pt is unaffected.")
     a = ap.parse_args(argv)
     _heads = None
     if a.loss_heads:
@@ -219,7 +295,9 @@ def main(argv=None) -> int:
         print(json.dumps({"deck": a.deck, "baseline": r}))
         return 0
     torch.manual_seed(a.seed); np.random.seed(a.seed)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from .device import cuda
+
+    dev = cuda()
     tr_idx = np.where(arrs["split"] == 0)[0]; va_idx = np.where(arrs["split"] == 1)[0]
     tr, va = Rows(arrs, tr_idx, dev), Rows(arrs, va_idx, dev)
     if a.init is not None:
@@ -242,14 +320,27 @@ def main(argv=None) -> int:
     hist, best = [], -1.0
     rng = np.random.default_rng(a.seed)
     t0 = time.time()
+    _ckpt_args = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()}
+
+    def save(path: Path, val: dict, ep: int) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # every Path in `args` must be stringified: torch 2.6 loads with weights_only=True by default and
+        # refuses a pickled WindowsPath, so a Path here makes the checkpoint unloadable by the reload
+        # below (and by anything else using the default). --init reintroduced exactly that bug (L67h).
+        torch.save({"model": model.state_dict(),
+                    "args": _ckpt_args | {"out_dir": str(a.out_dir), "data": str(a.data)},
+                    "deck": a.deck, "epoch": ep, "val": val, "n_params": n_params}, path)
+
+    last_save = time.time()
     for ep in range(a.epochs):
         model.train()
-        perm = rng.permutation(tr_idx)
+        perm = tr.bucket_perm(rng)
         tot, nb, parts_acc = 0.0, 0, {}
         for s in range(0, len(perm) - a.bs + 1, a.bs):
             b = tr.batch(perm[s:s + a.bs])
-            loss, parts = losses(model, b, mirror=(not a.no_mirror) and rng.random() < 0.5, grid=a.grid,
-                                 heads=_heads)
+            with torch.autocast("cuda", dtype=torch.bfloat16, enabled=not a.fp32):
+                loss, parts = losses(model, b, mirror=(not a.no_mirror) and rng.random() < 0.5, grid=a.grid,
+                                     heads=_heads)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -257,6 +348,10 @@ def main(argv=None) -> int:
             tot += float(loss); nb += 1
             for k, v in parts.items():
                 parts_acc[k] = parts_acc.get(k, 0.0) + v
+            if a.save_every and time.time() - last_save >= a.save_every:
+                save(deck.data_dir / "pipeline" / f"s1_{tag}_last.pt",
+                     {"rolling": True, "step": nb, "seen": nb * a.bs}, ep + 1)
+                last_save = time.time()
         ev = evaluate(model, va, grid=a.grid)
         ev.update({"epoch": ep + 1, "train_loss": tot / max(nb, 1),
                    "train_parts": {k: v / max(nb, 1) for k, v in parts_acc.items()}, "seconds": round(time.time() - t0)})
@@ -264,13 +359,7 @@ def main(argv=None) -> int:
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in ev.items() if k != "train_parts"}), flush=True)
         if ev[a.select] > best:
             best = ev[a.select]
-            ckpt.parent.mkdir(parents=True, exist_ok=True)
-            # every Path in `args` must be stringified: torch 2.6 loads with weights_only=True by default and
-            # refuses a pickled WindowsPath, so a Path here makes the checkpoint unloadable by the reload
-            # below (and by anything else using the default). --init reintroduced exactly that bug (L67h).
-            _args = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()}
-            torch.save({"model": model.state_dict(), "args": _args | {"out_dir": str(a.out_dir), "data": str(a.data)},
-                        "deck": a.deck, "epoch": ep + 1, "val": ev, "n_params": n_params}, ckpt)
+            save(ckpt, ev, ep + 1)
         (a.out_dir / f"hist_{tag}.json").write_text(json.dumps({"deck": a.deck, "seed": a.seed, "n_params": n_params,
                                                                  "ckpt": str(ckpt), "hist": hist}, indent=1))
     # train-set agreement of the best checkpoint (the S1 gate quotes train AND val)

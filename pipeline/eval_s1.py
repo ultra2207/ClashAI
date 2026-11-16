@@ -1,6 +1,6 @@
 """Evaluate S1 checkpoints on the VAL rows of one dataset -- one instrument for models trained on different corpora.
 
-    python -m pipeline.eval_s1 hogeq --data hogeq/data/pipeline/s1_dataset.npz hogeq/data/pipeline/s1_hogeq_s0.pt ...
+    uv run python -m pipeline.eval_s1 hogeq --data hogeq/data/pipeline/s1_dataset.npz hogeq/data/pipeline/s1_hogeq_s0.pt ...
 
 Prints one JSON line per checkpoint (same keys as train_s1.evaluate) and writes nothing else.
 """
@@ -28,7 +28,9 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
     deck = load_deck(a.deck)
     arrs, meta = load_ds(a.data or (deck.data_dir / "pipeline" / "s1_dataset.npz"))
-    dev = torch.device("cpu")
+    from .device import cuda
+
+    dev = cuda()
     idx = np.where(arrs["split"] == a.split)[0]
     rows = Rows(arrs, idx, dev)
     for c in a.ckpts:

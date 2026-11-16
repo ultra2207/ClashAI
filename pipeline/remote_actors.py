@@ -2,7 +2,7 @@
 absent = the plain ActorPool, unchanged.
 
 
-    python -m pipeline.remote_actors --port 5601 --workers 24
+    uv run python -m pipeline.remote_actors --port 5601 --workers 24
 
 Sharding: with L local and W_r remote actors the update's job list is dealt ``jobs[a::N]`` over N = L + sum W_r global
 actor slots -- exactly ActorPool's deal for ``n_actors = N`` -- slots 0..L-1 local, then each remote's block in endpoint

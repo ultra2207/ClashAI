@@ -1,6 +1,6 @@
 """Generalist trainer: ``dataset_gen`` npz -> ``GenModel`` checkpoint + per-epoch metrics json.
 
-    python -m pipeline.train_gen --data icebow/data/pipeline/gen_dataset_starter.npz --seed 0 --epochs 16 \
+    uv run python -m pipeline.train_gen --data icebow/data/pipeline/gen_dataset_starter.npz --seed 0 --epochs 16 \
 
 Mirrors ``train_s1`` (AdamW lr 3e-4, wd 0.01, OneCycle pct 0.05, bs 256, grad clip 1.0, mirror p = 0.5, same loss
 weights): cell CE on PLAY rows teacher-forced on the pro's card IDENTITY, card CE over the 4 hand positions on PLAY
@@ -10,6 +10,11 @@ Each epoch scores the FULL v3val rows (the S1-comparable instrument) and a FIXED
 val rows (default 30,000; ids recorded in the history json); checkpoint = best ``--select`` metric (S1's default
 cell_tile_top1) on that sample, written to ``--out-dir/gen[_tag]_s<seed>.pt`` with S1's layout + ``gen`` /
 ``card_vocab`` / ``d_c``.
+``--resume PATH``: continue an interrupted run from its ``gen_<tag>.pt`` or ``gen_<tag>_latest.pt`` -- model,
+optimizer, LR schedule, epoch counter, per-epoch history and the row-order RNG are restored, and the checkpoint is
+rewritten every epoch (``_latest``) as well as on best val, so a cut costs at most one epoch. Refuses a checkpoint
+whose card_vocab / d_c / d / layers / grid differ; if ``--epochs`` changed, the LR schedule restarts over the
+remaining epochs (logged).
 ``--limit-rows N``: a seeded random N of the TRAIN rows (v3val is always complete).
 ``--deck-weighting sqrt``: each epoch draws len(train) rows WITH replacement, row weight 1 / sqrt(train rows of its
 deck), so a deck's share goes as sqrt(its rows) instead of its rows (icebow/hogeq sides dominate the starter).
@@ -242,7 +247,9 @@ def main_opp(a, arrs: dict, meta: dict) -> int:
     """
     from .model_gen import load_model
     torch.manual_seed(a.seed); np.random.seed(a.seed)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from .device import cuda
+
+    dev = cuda()
     rng = np.random.default_rng(a.seed)
     if a.opp_timing:
         rb = meta.get("row_builder") or {}
@@ -407,6 +414,10 @@ def main(argv=None) -> int:
     ap.add_argument("--memory-tables", type=Path, default=None)
     ap.add_argument("--hand-inferred", default="mask_card", help="mask_card (no card label on hand-inferred rows) | drop")
     ap.add_argument("--init", type=Path, default=None, help="opp trainer: fine-tune from this checkpoint")
+    ap.add_argument("--resume", type=Path, default=None,
+                    help="continue a run from its checkpoint (best or _latest): model + optimizer + scheduler + epoch "
+                         "counter + history + row-order RNG are restored, so the remaining epochs continue where the "
+                         "cut left off. Refuses a checkpoint whose vocab/dims/grid differ.")
     ap.add_argument("--opp-oversample", default="", help="MASK.npy:K -- opp trainer: train rows where the bool mask (one entry "
                     "per data row) is set appear K times per epoch (absent = unchanged)")
     ap.add_argument("--max-steps", type=int, default=0)
@@ -468,7 +479,9 @@ def main(argv=None) -> int:
         print(json.dumps({"warning": f"dataset built with grid {meta.get('grid')!r}, training with {a.grid!r}"}))
     a.out_dir.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(a.seed); np.random.seed(a.seed)
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from .device import cuda
+
+    dev = cuda()
     rng = np.random.default_rng(a.seed)
     tr_idx = np.where(arrs["split"] == 0)[0]
     if a.limit_rows and a.limit_rows < len(tr_idx):
@@ -514,11 +527,48 @@ def main(argv=None) -> int:
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, max_lr=a.lr, total_steps=max(steps, 1), pct_start=0.05)
     tag = f"{a.tag}_s{a.seed}" if a.tag else f"s{a.seed}"
     ckpt = a.out_dir / f"gen_{tag}.pt"
-    hist, best = [], -1.0
+    latest = a.out_dir / f"gen_{tag}_latest.pt"
+    hist, best, start_ep, ck_rl = [], -1.0, 0, {}
+    if a.resume is not None:
+        ck = torch.load(a.resume, map_location="cpu", weights_only=False)
+        if not ck.get("gen"):
+            raise SystemExit(f"--resume {a.resume}: not a generalist checkpoint (no 'gen' flag)")
+        if ck.get("card_vocab") != vocab_list:
+            raise SystemExit(f"--resume {a.resume}: card_vocab differs ({len(ck.get('card_vocab') or [])} vs "
+                             f"{len(vocab_list)}) -- resume against the dataset it was built for")
+        if int(ck.get("d_c", a.d_c)) != a.d_c:
+            raise SystemExit(f"--resume {a.resume}: d_c {ck.get('d_c')} != --d-c {a.d_c}")
+        a0 = ck.get("args") or {}
+        for k, mine in (("d", a.d), ("layers", a.layers), ("grid", a.grid),
+                        ("feature_version", a.feature_version)):
+            if a0.get(k) is not None and mine is not None and a0.get(k) != mine:
+                raise SystemExit(f"--resume {a.resume}: {k} {a0.get(k)!r} != {mine!r}")
+        model.load_state_dict(ck["model"])
+        ck_rl = ck.get("rl") or {}
+        if "optimizer" in ck_rl:
+            opt.load_state_dict(ck_rl["optimizer"])
+        hist = list(ck.get("hist") or [])
+        start_ep = int(ck.get("epoch") or len(hist))
+        best = max((float(h.get(a.select, -1.0)) for h in hist), default=-1.0)
+        if ck_rl.get("rng") is not None:                 # row order continues, not restarts
+            rng.bit_generator.state = ck_rl["rng"]
+        same_len = a0.get("epochs") is not None and int(a0["epochs"]) == a.epochs
+        if same_len and "sched" in ck_rl:
+            sched.load_state_dict(ck_rl["sched"])
+        elif a.epochs > start_ep:
+            sched = torch.optim.lr_scheduler.OneCycleLR(
+                opt, max_lr=a.lr, total_steps=max((a.epochs - start_ep) * (len(tr_idx) // a.bs), 1), pct_start=0.05)
+            print(json.dumps({"resume": str(a.resume), "note": "epoch budget changed: the LR schedule restarts over "
+                                                               "the remaining epochs"}), flush=True)
+        print(json.dumps({"resume": str(a.resume), "start_epoch": start_ep, "epochs": a.epochs,
+                          "history_restored": len(hist), "best": best}), flush=True)
+        if start_ep >= a.epochs:
+            print(json.dumps({"resume": str(a.resume), "status": "ALREADY_COMPLETE", "epoch": start_ep}), flush=True)
+            return 0
     if dev.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
     t0 = time.time()
-    for ep in range(a.epochs):
+    for ep in range(start_ep, a.epochs):
         model.train()
         te = time.time()
         perm = rng.permutation(tr_idx) if p_row is None else rng.choice(tr_idx, size=len(tr_idx), p=p_row)
@@ -554,14 +604,20 @@ def main(argv=None) -> int:
         print(json.dumps({k: (round(v, 4) if isinstance(v, float) else v) for k, v in ev.items()
                           if k not in ("train_parts", "v3val")}), flush=True)
         print(json.dumps({"v3val": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in ev_v3.items()}}), flush=True)
+        _args = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()}
+        _state = {"model": model.state_dict(), "args": _args, "deck": "generalist", "epoch": ep + 1, "val": ev,
+                  "n_params": n_params, "gen": True, "card_vocab": vocab_list, "d_c": a.d_c,
+                  "hist": hist, "rl": {"optimizer": opt.state_dict(), "sched": sched.state_dict(),
+                                       "rng": rng.bit_generator.state}}
+        torch.save(_state, latest)                     # every epoch: a cut costs one epoch, not the run
         if ev[a.select] > best:
             best = ev[a.select]
-            _args = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()}
-            torch.save({"model": model.state_dict(), "args": _args, "deck": "generalist", "epoch": ep + 1, "val": ev,
-                        "n_params": n_params, "gen": True, "card_vocab": vocab_list, "d_c": a.d_c}, ckpt)
+            torch.save(_state, ckpt)                   # best-val: what the docs/consumers load
         (a.out_dir / f"hist_gen_{tag}.json").write_text(json.dumps({"seed": a.seed, "n_params": n_params,
                                                                      "ckpt": str(ckpt), "val_sample": a.val_sample,
                                                                      "val_rows": va_idx.tolist(), "hist": hist}))
+    if not ckpt.is_file():                             # resumed from _latest and nothing beat `best`
+        ckpt = latest
     st = torch.load(ckpt, map_location=dev)
     model.load_state_dict(st["model"])
     ev_tr = evaluate(model, rows.view(rng.choice(tr_idx, size=min(len(tr_idx), 20000), replace=False)), grid=a.grid)

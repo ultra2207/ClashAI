@@ -22,7 +22,7 @@ Label grid: ``y_xy`` is S1's continuous board (x, y); ``y_cell`` is ``model_v3.c
 wait rows), so ``--grid lattice`` = §5cs.70. The i=1 rotation (§5cs.67) is applied upstream by the crawl; the
 driven corpora are already in one frame. Replays without ``frames`` give no wait rows (§5cs.69) -- counted.
 
-usage: icebow/.venv/Scripts/python.exe -m pipeline.dataset_gen --corpus DIR [DIR ...] --out PATH.npz
+usage: uv run python -m pipeline.dataset_gen --corpus DIR [DIR ...] --out PATH.npz
        [--grid lattice] [--limit N] [--workers 4] [--shift-ticks 26]
 """
 from __future__ import annotations
@@ -353,7 +353,8 @@ def v3val_tags(npz: Path = V3VAL_NPZ) -> set[str]:
 
 def build(corpora: list[Path], out: Path, *, grid: str = "lattice", limit: int = 0, workers: int = 4,
           wait_stride: int = 40, play_window: int = 20, val_pct: int = 10, v3val_npz: Path = V3VAL_NPZ,
-          shift_ticks: int = 0, feature_version: int = 1, log=sys.stderr) -> dict[str, Any]:
+          shift_ticks: int = 0, feature_version: int = 1, spool_rows: bool = False,
+          log=sys.stderr) -> dict[str, Any]:
     t0 = time.time()
     files, seen = [], set()
     for c in corpora:
@@ -385,6 +386,27 @@ def build(corpora: list[Path], out: Path, *, grid: str = "lattice", limit: int =
                 print(f'[dataset_gen] {i+1}/{len(jobs)} {time.time()-t0:.0f}s', file=log, flush=True)
         if jobs:
             del row
+    elif spool_rows:
+        # Memory-safe ANY-version build: every replay's rows go to disk as they arrive, so `res` never holds the
+        # whole corpus. Parallel workers keep map order, so the row order (and therefore `rep` ids) is unchanged.
+        import uuid
+        from .dataset_spool import ReplaySpool, ArraySpool  # noqa: F401
+        out.parent.mkdir(parents=True, exist_ok=True)
+        spool = out.parent / ('gen_build_' + uuid.uuid4().hex)
+        spool.mkdir()
+        res = ReplaySpool(spool)
+        if workers > 1:
+            with ProcessPoolExecutor(max_workers=workers) as ex:
+                for i, r in enumerate(ex.map(_job, jobs, chunksize=8)):
+                    res.append(r)
+                    if log and (i + 1) % 500 == 0:
+                        print(f'[dataset_gen] spooled {i + 1}/{len(jobs)} {time.time() - t0:.0f}s', file=log,
+                              flush=True)
+        else:
+            for i, job in enumerate(jobs):
+                res.append(_job(job))
+                if log and (i + 1) % 100 == 0:
+                    print(f'[dataset_gen] spooled {i + 1}/{len(jobs)} {time.time() - t0:.0f}s', file=log, flush=True)
     elif workers > 1:
         with ProcessPoolExecutor(max_workers=workers) as ex:
             res = []
@@ -400,7 +422,7 @@ def build(corpora: list[Path], out: Path, *, grid: str = "lattice", limit: int =
     if spool is None:
         res = [r for r in res if "error" not in r]
 
-    vocab_keys = sorted({k for r in res for k in r["keys"]})
+    vocab_keys = sorted({k for r in res if "error" not in r for k in r["keys"]})
     gid = {k: i + 1 for i, k in enumerate(vocab_keys)}          # 0 = pad
     deck_ix: dict[tuple, int] = {}
     parts: dict[str, list[np.ndarray]] = {}
@@ -410,6 +432,9 @@ def build(corpora: list[Path], out: Path, *, grid: str = "lattice", limit: int =
     unmapped: set = set()
     sides_per_deck: Counter = Counter()
     for r in res:
+        if "error" in r:                                        # spooled runs keep failures on disk, not in hand
+            st["failed_recordings"] += 1
+            continue
         for k, v in r["stats"].items():
             if isinstance(v, set):
                 unmapped |= v
@@ -587,7 +612,7 @@ def memory_tables(dataset: Path, out: Path, *, workers: int = 4, limit: int = 0,
     ``corpora``, read like ``build``) -> ``out`` (npz): tab_<k> (match_memory.pack of the tables, TABLE_KEYS + off),
     table_tag / table_side, row_tab [rows of ``dataset``] (index of the row's (tag, side) table; -1 = none) and meta. A row's
     memory = match_memory.rows_features(tables, row_tab, the npz ``tick``, the npz ``deck_card``, ids). ``workers`` > 1 =
-        python -m pipeline.dataset_gen memory --dataset icebow/data/pipeline/gen_dataset_v32_fv5.npz \\
+        uv run python -m pipeline.dataset_gen memory --dataset icebow/data/pipeline/gen_dataset_v32_fv5.npz \\
             --out icebow/data/pipeline/gen_dataset_v32_fv5_memory_v1.npz --workers N [--limit 20]"""
     from . import match_memory as MM
     t0 = time.time()
@@ -673,10 +698,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--val-pct", type=int, default=10)
     ap.add_argument("--v3val-npz", type=Path, default=V3VAL_NPZ)
     ap.add_argument("--shift-ticks", type=int, default=0)
+    ap.add_argument("--spool", action="store_true",
+                    help="stream rows through a disk spool (any feature version, keeps parallel workers): "
+                         "required when the corpus is too large to concatenate in RAM")
     a = ap.parse_args(argv)
     s = build(a.corpus, a.out, grid=a.grid, limit=a.limit, workers=a.workers, wait_stride=a.wait_stride,
               play_window=a.play_window, val_pct=a.val_pct, v3val_npz=a.v3val_npz,
-              shift_ticks=a.shift_ticks, feature_version=a.feature_version)
+              shift_ticks=a.shift_ticks, feature_version=a.feature_version, spool_rows=a.spool)
     print(json.dumps(s, default=str))
     return 0
 

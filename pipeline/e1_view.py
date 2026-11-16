@@ -23,7 +23,7 @@ import numpy as np
 from . import vocab
 from .obs_contract import (
     DEGRADE_PRECISION, DEGRADE_RECALL, TILES_X, TILES_Y, UNKNOWN_TEAM_RATE, WRONG_TEAM_RATE,
-    BoardState, Deck, Unit, _draw_conf, _FP_JITTER_TILES, _TP_SIGMA_TILES, mine_classes,
+    BoardState, Deck, Unit, _clamp, _draw_conf, _FP_JITTER_TILES, _TP_SIGMA_TILES, mine_classes,
 )
 
 KING_HP_LIVE = 1.0
@@ -75,6 +75,19 @@ ALL_NOISE_OFF = Noise(recall=False, false_pos=False, position=False, team=False,
 # ------------------------------------------------------------------------------------------------------
 # a component-switchable copy of obs_contract.degrade -- READ-ONLY on obs_contract.py itself
 # ------------------------------------------------------------------------------------------------------
+# Detector classes by kind, built once: `_degrade_switchable` rebuilt this per call (18.6 us of every
+# observation, ~3 calls per decision) and only ever reads it. Same contents, same order, so every RNG draw is
+# unchanged -- test_e1_noise_arms pins the whole function bit-identical to obs_contract.degrade().
+def _kinds_by_kind() -> dict[str, list[int]]:
+    out: dict[str, list[int]] = {"troop": [], "building": [], "spell": []}
+    for i in range(vocab.N_DETECTOR):
+        out[vocab.kind_of(i)].append(i)
+    return out
+
+
+_KINDS: dict[str, list[int]] = _kinds_by_kind()
+
+
 def _degrade_switchable(bs: BoardState, rng: np.random.Generator, noise: Noise) -> BoardState:
     """``obs_contract.degrade(bs, rng)`` with each noise component individually switchable.
 
@@ -102,52 +115,62 @@ def _degrade_switchable(bs: BoardState, rng: np.random.Generator, noise: Noise) 
     false positive from a dropped unit, so a rescued unit never does either.
     """
     fp_rate = (1.0 - DEGRADE_PRECISION) / DEGRADE_PRECISION
-    kinds: dict[str, list[int]] = {"troop": [], "building": [], "spell": []}
-    for i in range(vocab.N_DETECTOR):
-        kinds[vocab.kind_of(i)].append(i)
+    kinds: dict[str, list[int]] = _KINDS                          # module-level: rebuilt per call before (18.6 us)
     side_rng = np.random.Generator(rng.bit_generator.jumped())   # rescued-unit noise only; see docstring
+    # per-call invariants: the flags and the vocab/clip lookups were re-read for EVERY unit
+    n_team, n_pos = noise.team, noise.position
+    n_hp, n_dep, n_conf = noise.unit_hp, noise.deploying, noise.conf
+    n_fp, n_recall = noise.false_pos, noise.recall
+    kind_of, clamp = vocab.kind_of, _clamp
+    team_rate = WRONG_TEAM_RATE.get
+    unknown_team = UNKNOWN_TEAM_RATE
+    normal, random_, integers = rng.normal, rng.random, rng.integers
 
     def rolled(u: Unit, cls: Optional[int], jitter: float, gen: Optional[np.random.Generator] = None) -> Unit:
         """The fully-noised unit degrade()'s ``noisy()`` would build -- draws dx/dy, the team roll and a
         fresh conf UNCONDITIONALLY from ``gen`` (default: the main ``rng``); ``noise`` only picks which of
         those the returned Unit carries."""
-        g = rng if gen is None else gen
-        dx = g.normal(0.0, jitter) / TILES_X if jitter > 0 else 0.0
-        dy = g.normal(0.0, jitter) / TILES_Y if jitter > 0 else 0.0
-        r = g.random()
-        wrong = WRONG_TEAM_RATE.get(vocab.kind_of(u.cls), 0.0)
-        if UNKNOWN_TEAM_RATE and r < UNKNOWN_TEAM_RATE:
+        if gen is None:
+            dx = normal(0.0, jitter) / TILES_X if jitter > 0 else 0.0
+            dy = normal(0.0, jitter) / TILES_Y if jitter > 0 else 0.0
+            r, conf = random_(), _draw_conf(rng)
+        else:
+            dx = gen.normal(0.0, jitter) / TILES_X if jitter > 0 else 0.0
+            dy = gen.normal(0.0, jitter) / TILES_Y if jitter > 0 else 0.0
+            r, conf = gen.random(), _draw_conf(gen)
+        wrong = team_rate(kind_of(u.cls), 0.0)
+        if unknown_team and r < unknown_team:
             rolled_side = -1
-        elif wrong and r < (UNKNOWN_TEAM_RATE or 0.0) + wrong and u.side in (0, 1):
+        elif wrong and r < (unknown_team or 0.0) + wrong and u.side in (0, 1):
             rolled_side = 1 - u.side
         else:
             rolled_side = u.side
-        conf = _draw_conf(g)
-        side = rolled_side if noise.team else u.side
-        x = float(np.clip(u.x + (dx if noise.position else 0.0), 0.0, 1.0))
-        y = float(np.clip(u.y + (dy if noise.position else 0.0), 0.0, 1.0))
-        hp = None if noise.unit_hp else u.hp_frac
-        dep = None if noise.deploying else u.deploying
-        return Unit(u.cls if cls is None else cls, side, x, y, hp, dep, None, conf if noise.conf else u.conf,
+        side = rolled_side if n_team else u.side
+        x = clamp(u.x + (dx if n_pos else 0.0), 0.0, 1.0)     # _clamp == np.clip, 2.3 us -> 0.05 us
+        y = clamp(u.y + (dy if n_pos else 0.0), 0.0, 1.0)
+        hp = None if n_hp else u.hp_frac
+        dep = None if n_dep else u.deploying
+        return Unit(u.cls if cls is None else cls, side, x, y, hp, dep, None, conf if n_conf else u.conf,
                     form=u.form if cls is None else 0)
 
     def pass_(seq: Sequence[Unit], *, with_fp: bool) -> list[Unit]:
         out: list[Unit] = []
+        append = out.append
         for u in seq:
-            kept = rng.random() < DEGRADE_RECALL                     # always drawn -- degrade()'s own roll
+            kept = random_() < DEGRADE_RECALL                       # always drawn -- degrade()'s own roll
             if not kept:
-                if not noise.recall:                                  # rescued: noised on the SIDE stream,
-                    out.append(rolled(u, None, _TP_SIGMA_TILES, gen=side_rng))  # never an FP source
+                if not n_recall:                                      # rescued: noised on the SIDE stream,
+                    append(rolled(u, None, _TP_SIGMA_TILES, gen=side_rng))  # never an FP source
                 continue                                              # recall ON: matches degrade() exactly
-            out.append(rolled(u, None, _TP_SIGMA_TILES))
+            append(rolled(u, None, _TP_SIGMA_TILES))
             if with_fp:
-                add = rng.random() < fp_rate                          # always drawn for a kept unit
+                add = random_() < fp_rate                             # always drawn for a kept unit
                 if add:                                                # draws below ALWAYS spent when add
-                    pool = kinds[vocab.kind_of(u.cls)]
-                    fp_cls = int(pool[rng.integers(len(pool))])
+                    pool = kinds[kind_of(u.cls)]
+                    fp_cls = int(pool[integers(len(pool))])
                     fp_unit = rolled(u, fp_cls, max(_TP_SIGMA_TILES, _FP_JITTER_TILES))
-                    if noise.false_pos:                                # false_pos only gates the append
-                        out.append(fp_unit)
+                    if n_fp:                                           # false_pos only gates the append
+                        append(fp_unit)
         return out
 
     units = pass_(bs.units, with_fp=True)

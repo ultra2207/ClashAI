@@ -1,6 +1,6 @@
 """Plan A S3: imitation warm-start of ONLY the match-memory adapter.
 
-    python -m pipeline.train_memory --init CKPT --memory v1|v2 --memory-tables gen_dataset_v32_fv5_memory_v1.npz \
+    uv run python -m pipeline.train_memory --init CKPT --memory v1|v2 --memory-tables gen_dataset_v32_fv5_memory_v1.npz \
         --data icebow/data/pipeline/gen_dataset_v32_fv5.npz --trainable memory --out-dir DIR [--epochs 2] [--amp bf16]
 
 Lead 10-25: the init (an RL policy, e.g. CLXIII) keeps EVERY weight FROZEN; only the new memory parameters (model_gen
@@ -714,7 +714,9 @@ def main(argv=None) -> int:
     t0 = time.time()
     torch.manual_seed(a.seed)
     rng = np.random.default_rng(a.seed)
-    dev = torch.device(a.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    from .device import resolve
+
+    dev = resolve(a.device)
     if a.head_rows:
         arrs, meta = npz_head(a.data, a.head_rows)
     else:

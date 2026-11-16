@@ -218,8 +218,21 @@ def build_replay(rec: dict, deck: Deck, rows: _Rows, rep_index: int, *, wait_str
                 st[off] = st.get(off, 0) + 1
             else:
                 t0 = int(pf["tick"])
-                bs = from_engine(_as_compact(pf), side, deck, engine_deck=engine_deck,
+                # The compact play frame's own `players.hand` is a POST-act snapshot: the played card has already
+                # left the hand and the drawn card is in it. Measured over the 766-replay corpus, the card a play
+                # played is missing from that frame's hand in ~51% of accepted plays, while it is present in the
+                # log's `hand_before` in 28,423 / 28,423. Handing the post-act hand to from_engine put the label
+                # outside `hand_mask_from_sc` on half the PLAY rows, which masks the correct card logit with
+                # -1e4 and pins the card head's loss near 0.51 * 1e4 (the 4,890 seen in training) instead of ~2.
+                hand, nxt_card = _hand_of(e, pframes, side)
+                obs = _as_compact(pf)
+                obs["players"] = [{"side": side, "hand": hand, "next": nxt_card}]
+                bs = from_engine(obs, side, deck, engine_deck=engine_deck,
                                  unmapped=st.setdefault("unmapped", set()), feature_version=feature_version)
+                if deck.card_ids[slot] not in bs.my_hand:
+                    st["drop_combo"] = st.get("drop_combo", 0) + 1
+                    done.append((int(e["tick"]), slot, xy[0], xy[1]))     # the play still happened
+                    continue
             rows.add(bs, slot=slot, xy=xy, gate=1, wait_slot=slot, wait_dt=0.0, tick=t0,
                      rep=rep_index, side=side, split=split, past=_past(done, t0), crowns=crowns)
             done.append((int(e["tick"]), slot, xy[0], xy[1]))
